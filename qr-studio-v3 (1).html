@@ -1,0 +1,735 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>QR Studio</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+
+<!--
+  ══════════════════════════════════════════════════
+  FIRESTORE SECURITY RULES — update di Firebase Console
+  ══════════════════════════════════════════════════
+  rules_version = '2';
+  service cloud.firestore {
+    match /databases/{database}/documents {
+      match /users/{userId}/projects/{projectId} {
+        allow read, write: if request.auth != null && request.auth.uid == userId;
+      }
+      // Siapa pun bisa CREATE scan (yang scan QR tidak perlu login)
+      // Hanya owner yang bisa READ scan miliknya
+      match /users/{userId}/projects/{projectId}/scans/{scanId} {
+        allow create: if true;
+        allow read, list: if request.auth != null && request.auth.uid == userId;
+      }
+    }
+  }
+  ══════════════════════════════════════════════════
+-->
+
+<script type="module">
+import { initializeApp }
+  from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
+import { getAuth, sendSignInLinkToEmail, isSignInWithEmailLink,
+         signInWithEmailLink, onAuthStateChanged, signOut }
+  from "https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js";
+import { getFirestore, collection, doc, setDoc, addDoc,
+         getDocs, deleteDoc, query, orderBy, Timestamp }
+  from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
+
+const firebaseConfig = {
+  apiKey:            "AIzaSyCvwhEkJYEdA0iAC1LlSTp33OGIZjdkt0o",
+  authDomain:        "qrgenerator-8cc5f.firebaseapp.com",
+  projectId:         "qrgenerator-8cc5f",
+  storageBucket:     "qrgenerator-8cc5f.firebasestorage.app",
+  messagingSenderId: "228234969715",
+  appId:             "1:228234969715:web:cddaf9e6459bb0c6266006"
+};
+
+const firebaseApp = initializeApp(firebaseConfig);
+const auth = getAuth(firebaseApp);
+const db   = getFirestore(firebaseApp);
+
+/* ══════════════════════════════════════
+   SCAN TRACKING — dijalankan sebelum auth
+   Kalau URL mengandung ?scan=... berarti
+   seseorang baru saja scan QR code.
+   ══════════════════════════════════════ */
+async function handleScanRedirect() {
+  const params = new URLSearchParams(window.location.search);
+  const projectId = params.get('scan');
+  const ownerUid  = params.get('u');
+  const dest      = params.get('dest');
+
+  if (!projectId || !ownerUid || !dest) return false;
+
+  // Tampilkan layar redirect
+  document.getElementById('redirectOverlay').style.display = 'flex';
+
+  // Ambil info device & geo
+  let ip = '—', kec = '—', kota = '—';
+  try {
+    const geo = await fetch('https://ipapi.co/json/').then(r => r.json());
+    ip   = geo.ip   || '—';
+    kota = geo.city || '—';
+    kec  = geo.region || '—';
+  } catch(_) {}
+
+  const ua     = navigator.userAgent;
+  const device = /Mobi|Android/i.test(ua) ? 'Mobile' : 'Desktop';
+  const browser = /Chrome/i.test(ua) && !/Edg/i.test(ua) ? 'Chrome'
+                : /Safari/i.test(ua) && !/Chrome/i.test(ua) ? 'Safari'
+                : /Firefox/i.test(ua) ? 'Firefox'
+                : /Edg/i.test(ua) ? 'Edge'
+                : 'Other';
+  const os = /Android/i.test(ua) ? 'Android'
+           : /iPhone|iPad/i.test(ua) ? 'iOS'
+           : /Windows/i.test(ua) ? 'Windows'
+           : /Mac/i.test(ua) ? 'macOS'
+           : 'Other';
+
+  // Tulis scan ke Firestore (tidak perlu login)
+  try {
+    await addDoc(
+      collection(db, 'users', ownerUid, 'projects', projectId, 'scans'),
+      { time: Timestamp.now(), device, browser, os, ip, kec, kota }
+    );
+  } catch(e) {
+    console.error('Scan log error', e);
+  }
+
+  // Redirect ke URL asli
+  window.location.replace(decodeURIComponent(dest));
+  return true;
+}
+
+/* ══════════════════════════════════════
+   AUTH — EMAIL LINK
+   ══════════════════════════════════════ */
+async function handleMagicLinkRedirect() {
+  if (!isSignInWithEmailLink(auth, window.location.href)) return false;
+  let email = localStorage.getItem('qrs_pendingEmail');
+  if (!email) email = window.prompt('Masukkan email yang dipakai untuk login:');
+  if (!email) return false;
+  try {
+    showLoading('Memverifikasi link...');
+    await signInWithEmailLink(auth, email, window.location.href);
+    localStorage.removeItem('qrs_pendingEmail');
+    window.history.replaceState({}, document.title, window.location.pathname);
+    return true;
+  } catch(e) {
+    hideLoading();
+    setAuthError('Link tidak valid atau sudah kedaluwarsa. Coba login ulang.');
+    return false;
+  }
+}
+
+async function sendMagicLink() {
+  const email = document.getElementById('emailInput').value.trim();
+  const err   = document.getElementById('emailError');
+  if (!email || !email.includes('@') || !email.includes('.')) {
+    err.textContent = 'Masukkan email yang valid.'; return;
+  }
+  err.textContent = '';
+  const btn = document.getElementById('sendLinkBtn');
+  btn.disabled = true; btn.textContent = 'Mengirim...';
+  try {
+    await sendSignInLinkToEmail(auth, email, {
+      url: window.location.origin + window.location.pathname,
+      handleCodeInApp: true
+    });
+    localStorage.setItem('qrs_pendingEmail', email);
+    document.getElementById('sentToEmail').textContent = email;
+    document.getElementById('stepEmail').classList.remove('active');
+    document.getElementById('stepSent').classList.add('active');
+  } catch(e) {
+    err.textContent = 'Gagal mengirim: ' + (e.message || 'coba lagi');
+    btn.disabled = false; btn.textContent = 'Kirim Magic Link';
+  }
+}
+
+function backToEmail() {
+  document.getElementById('stepSent').classList.remove('active');
+  document.getElementById('stepEmail').classList.add('active');
+  document.getElementById('sendLinkBtn').disabled = false;
+  document.getElementById('sendLinkBtn').textContent = 'Kirim Magic Link';
+  document.getElementById('emailError').textContent = '';
+}
+
+async function doLogout() {
+  await signOut(auth);
+  document.getElementById('app').classList.remove('visible');
+  document.getElementById('authOverlay').classList.remove('hidden');
+  document.getElementById('stepSent').classList.remove('active');
+  document.getElementById('stepEmail').classList.add('active');
+  document.getElementById('emailInput').value = '';
+  document.getElementById('sendLinkBtn').disabled = false;
+  document.getElementById('sendLinkBtn').textContent = 'Kirim Magic Link';
+  projects = []; activeId = null;
+  document.getElementById('analyticsSection').style.display = 'none';
+}
+
+function setAuthError(msg) {
+  document.getElementById('emailError').textContent = msg;
+  document.getElementById('stepEmail').classList.add('active');
+}
+
+/* ══════════════════════════════════════
+   AUTH STATE
+   ══════════════════════════════════════ */
+let currentUid = null;
+
+// Cek scan redirect dulu, baru handle auth
+handleScanRedirect().then(isRedirecting => {
+  if (isRedirecting) return; // akan redirect, stop di sini
+  handleMagicLinkRedirect().then(() => {
+    onAuthStateChanged(auth, user => {
+      hideLoading();
+      if (user) {
+        currentUid = user.uid;
+        enterApp(user.email);
+      } else {
+        currentUid = null;
+        if (!isSignInWithEmailLink(auth, window.location.href)) {
+          document.getElementById('authOverlay').classList.remove('hidden');
+          document.getElementById('app').classList.remove('visible');
+        }
+      }
+    });
+  });
+});
+
+function enterApp(email) {
+  document.getElementById('authOverlay').classList.add('hidden');
+  document.getElementById('app').classList.add('visible');
+  document.getElementById('userEmail').textContent = email;
+  loadProjects();
+}
+
+/* ══════════════════════════════════════
+   PROJECTS + SCANS — FIRESTORE
+   ══════════════════════════════════════ */
+let projects = [];
+let activeId  = null;
+
+function projectRef(id) {
+  return doc(db, 'users', currentUid, 'projects', id);
+}
+function scansRef(projectId) {
+  return collection(db, 'users', currentUid, 'projects', projectId, 'scans');
+}
+
+async function loadProjects() {
+  if (!currentUid) return;
+  showSaving('Memuat projects...');
+  try {
+    const snap = await getDocs(
+      query(collection(db, 'users', currentUid, 'projects'), orderBy('created', 'desc'))
+    );
+    // Load project metadata + scans sekaligus
+    projects = await Promise.all(snap.docs.map(async d => {
+      const data = d.data();
+      // Load scans subcollection
+      let scans = [];
+      try {
+        const sSnap = await getDocs(query(scansRef(d.id), orderBy('time', 'desc')));
+        scans = sSnap.docs.map(s => {
+          const sd = s.data();
+          return { ...sd, time: sd.time?.toDate ? sd.time.toDate() : new Date(sd.time) };
+        });
+      } catch(_) {}
+      return {
+        ...data,
+        created: data.created?.toDate ? data.created.toDate() : new Date(data.created),
+        scans
+      };
+    }));
+  } catch(e) {
+    console.error('Load error', e); projects = [];
+  }
+  hideSaving();
+  renderProjects();
+}
+
+async function saveProject(proj) {
+  if (!currentUid) return;
+  showSaving('Menyimpan...');
+  try {
+    // Simpan metadata saja (scans ada di subcollection)
+    const { scans, ...meta } = proj;
+    await setDoc(projectRef(proj.id), {
+      ...meta,
+      created: meta.created instanceof Date ? Timestamp.fromDate(meta.created) : meta.created
+    });
+  } catch(e) { console.error('Save error', e); }
+  hideSaving();
+}
+
+async function deleteProject(id) {
+  if (!currentUid) return;
+  try {
+    // Hapus semua scan dulu
+    const sSnap = await getDocs(scansRef(id));
+    await Promise.all(sSnap.docs.map(d => deleteDoc(d.ref)));
+    await deleteDoc(projectRef(id));
+  } catch(e) { console.error('Delete error', e); }
+}
+
+/* ══════════════════════════════════════
+   TRACKING URL HELPER
+   Format: [halaman ini]?scan={id}&u={uid}&dest={encodedUrl}
+   ══════════════════════════════════════ */
+function trackingUrl(proj) {
+  const base = window.location.origin + window.location.pathname;
+  return `${base}?scan=${proj.id}&u=${currentUid}&dest=${encodeURIComponent(proj.url)}`;
+}
+
+/* ══════════════════════════════════════
+   GENERATE
+   ══════════════════════════════════════ */
+function generate() {
+  const url   = document.getElementById('urlInput').value.trim();
+  if (!url) return;
+  const label = document.getElementById('labelInput').value.trim()
+                || url.replace(/https?:\/\//, '').substring(0, 40);
+
+  const id   = Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+  const proj = { id, label, url, created: new Date(), qrDataUrl: null };
+
+  // QR code mengarah ke tracking URL, bukan langsung ke URL asli
+  const tUrl = trackingUrl({ id, url });
+
+  const box = document.getElementById('qrBox');
+  box.classList.remove('empty');
+  box.innerHTML = '';
+  new QRCode(box, { text: tUrl, width: 196, height: 196,
+    colorDark: '#000', colorLight: '#fff', correctLevel: QRCode.CorrectLevel.H });
+
+  projects.unshift({ ...proj, scans: [] });
+
+  setTimeout(() => {
+    const img = box.querySelector('img');
+    if (img) {
+      projects[0].qrDataUrl = img.src;
+      proj.qrDataUrl = img.src;
+    }
+    saveProject(projects[0]);
+    renderProjects();
+    selectProject(id);
+  }, 300);
+
+  document.getElementById('labelInput').value = '';
+}
+
+/* ══════════════════════════════════════
+   RENDER PROJECT LIST
+   ══════════════════════════════════════ */
+function renderProjects() {
+  const el = document.getElementById('projectsList');
+  document.getElementById('projCount').textContent =
+    projects.length ? projects.length + ' project' + (projects.length > 1 ? 's' : '') : '';
+  if (!projects.length) {
+    el.innerHTML = '<div class="empty-box">Belum ada project. Generate QR code pertama Anda.</div>';
+    return;
+  }
+  el.innerHTML = projects.map(p => `
+    <div class="p-card ${p.id === activeId ? 'active' : ''}" onclick="selectProject('${p.id}')">
+      <div class="mqr">${p.qrDataUrl
+        ? `<img src="${p.qrDataUrl}">`
+        : '<span style="color:var(--text-faint);font-size:.6rem">QR</span>'}</div>
+      <div class="info">
+        <div class="nm">${esc(p.label)}</div>
+        <div class="ur">${esc(p.url)}</div>
+      </div>
+      <div class="rt">
+        <div class="meta">
+          <div class="sc">${p.scans.length} <span style="font-size:.6rem;color:var(--text-dim)">scan${p.scans.length !== 1 ? 's' : ''}</span></div>
+          <div class="dt">${p.created.toLocaleDateString('id-ID', {day:'2-digit',month:'short',year:'numeric'})}</div>
+        </div>
+        <div>
+          <span class="del-btn"
+            onmousedown="event.stopPropagation();startDel('${p.id}',this)"
+            ontouchstart="event.stopPropagation();startDel('${p.id}',this)"
+            onmouseup="cancelDel()" onmouseleave="cancelDel()" ontouchend="cancelDel()"
+            title="Tahan 2 detik untuk hapus">🗑</span>
+          <div class="del-progress" id="dp-${p.id}"><div class="bar"></div></div>
+        </div>
+      </div>
+    </div>`).join('');
+}
+
+/* ══════════════════════════════════════
+   SELECT PROJECT — tampilkan detail + QR
+   ══════════════════════════════════════ */
+function selectProject(id) {
+  activeId = id;
+  const p = projects.find(x => x.id === id);
+  if (!p) return;
+  renderProjects();
+
+  const sec = document.getElementById('analyticsSection');
+  sec.style.display = 'block';
+
+  // ── Header ──
+  document.getElementById('detailLabel').textContent = p.label;
+  document.getElementById('detailUrl').textContent   = p.url;
+
+  // ── QR Code ──
+  const qrEl = document.getElementById('detailQr');
+  qrEl.innerHTML = '';
+  if (p.qrDataUrl) {
+    const img = document.createElement('img');
+    img.src = p.qrDataUrl;
+    img.style.cssText = 'width:180px;height:180px;display:block';
+    qrEl.appendChild(img);
+  } else {
+    // Re-generate QR untuk tampil di panel (tanpa simpan ulang)
+    const tUrl = trackingUrl(p);
+    new QRCode(qrEl, { text: tUrl, width: 180, height: 180,
+      colorDark: '#000', colorLight: '#fff', correctLevel: QRCode.CorrectLevel.H });
+  }
+
+  // ── Tracking URL ──
+  const tUrl = trackingUrl(p);
+  document.getElementById('trackingUrlText').textContent = tUrl;
+
+  // ── Stats ──
+  const s = p.scans;
+  document.getElementById('totalScans').textContent    = s.length;
+  document.getElementById('uniqueDevices').textContent = s.length ? new Set(s.map(x => x.device + x.ip)).size : 0;
+  if (s.length) {
+    const kc = {}; s.forEach(x => { kc[x.kec] = (kc[x.kec] || 0) + 1; });
+    document.getElementById('topKec').textContent   = Object.entries(kc).sort((a,b) => b[1]-a[1])[0][0];
+    document.getElementById('lastScan').textContent = fmt(s[0].time);
+    document.getElementById('logBody').innerHTML = s.map(x => `<tr>
+      <td>${fmtFull(x.time)}</td><td>${x.device}</td>
+      <td><span class="tag">${x.browser}</span></td><td>${x.os}</td>
+      <td>${x.kec}, ${x.kota}</td><td>${x.ip}</td>
+    </tr>`).join('');
+  } else {
+    document.getElementById('topKec').textContent   = '—';
+    document.getElementById('lastScan').textContent = '—';
+    document.getElementById('logBody').innerHTML    =
+      '<tr><td colspan="6" class="empty-tbl">Belum ada scan. Bagikan QR code di atas untuk mulai tracking.</td></tr>';
+  }
+  sec.scrollIntoView({ behavior: 'smooth', block: 'start' });
+}
+
+/* ── Copy tracking URL ── */
+function copyTrackingUrl() {
+  const url = document.getElementById('trackingUrlText').textContent;
+  navigator.clipboard.writeText(url).then(() => {
+    const btn = document.getElementById('copyUrlBtn');
+    btn.textContent = '✓ Disalin';
+    setTimeout(() => { btn.textContent = 'Salin'; }, 2000);
+  });
+}
+
+/* ── Download QR dari detail panel ── */
+function downloadDetailQR() {
+  const img = document.querySelector('#detailQr img');
+  if (!img) return;
+  const a = document.createElement('a'); a.href = img.src; a.download = 'qrcode.png'; a.click();
+}
+
+/* ── Download QR dari generator ── */
+function downloadQR() {
+  const img = document.querySelector('#qrBox img');
+  if (!img) return;
+  const a = document.createElement('a'); a.href = img.src; a.download = 'qrcode.png'; a.click();
+}
+
+/* ── Hold-to-delete ── */
+let delTimer = null;
+function startDel(id, el) {
+  const bar = document.getElementById('dp-' + id);
+  if (bar) { bar.classList.add('show'); bar.querySelector('.bar').style.width = '100%'; }
+  el.textContent = '⏳';
+  delTimer = setTimeout(async () => {
+    const i = projects.findIndex(x => x.id === id);
+    if (i > -1) projects.splice(i, 1);
+    if (activeId === id) { activeId = null; document.getElementById('analyticsSection').style.display = 'none'; }
+    await deleteProject(id);
+    renderProjects();
+  }, 2000);
+}
+function cancelDel() {
+  if (delTimer) { clearTimeout(delTimer); delTimer = null; }
+  document.querySelectorAll('.del-progress').forEach(d => { d.classList.remove('show'); d.querySelector('.bar').style.width = '0'; });
+  document.querySelectorAll('.del-btn').forEach(e => { e.textContent = '🗑'; });
+}
+
+/* ── Utils ── */
+function fmt(d) { const m = Math.floor((Date.now() - d) / 60000); if (m < 60) return m + 'm ago'; if (m < 1440) return Math.floor(m/60) + 'h ago'; return Math.floor(m/1440) + 'd ago'; }
+function fmtFull(d) { return d.toLocaleDateString('id-ID',{day:'2-digit',month:'short',year:'numeric'}) + ' ' + d.toLocaleTimeString('id-ID',{hour:'2-digit',minute:'2-digit'}); }
+function esc(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
+function showLoading(msg) { document.getElementById('loadingOverlay').style.display='flex'; document.getElementById('loadingMsg').textContent=msg||'Memuat...'; }
+function hideLoading()     { document.getElementById('loadingOverlay').style.display='none'; }
+function showSaving(msg)   { document.getElementById('savingBar').style.display='block'; document.getElementById('savingMsg').textContent=msg||'Menyimpan...'; }
+function hideSaving()      { document.getElementById('savingBar').style.display='none'; }
+
+/* ── Globals ── */
+window.sendMagicLink    = sendMagicLink;
+window.backToEmail      = backToEmail;
+window.doLogout         = doLogout;
+window.generate         = generate;
+window.downloadQR       = downloadQR;
+window.downloadDetailQR = downloadDetailQR;
+window.copyTrackingUrl  = copyTrackingUrl;
+window.selectProject    = selectProject;
+window.startDel         = startDel;
+window.cancelDel        = cancelDel;
+
+document.getElementById('emailInput').addEventListener('keydown', e => { if (e.key === 'Enter') sendMagicLink(); });
+document.getElementById('urlInput').addEventListener('keydown',   e => { if (e.key === 'Enter') generate(); });
+</script>
+
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=DM+Sans:wght@300;400;500;600&family=JetBrains+Mono:wght@300;400&display=swap');
+*{margin:0;padding:0;box-sizing:border-box}
+:root{
+  --bg:#f7f7f7;--surface:#fff;--surface2:#f0f0f0;
+  --border:#e0e0e0;--text:#111;--text-sec:#555;--text-dim:#999;--text-faint:#ccc;
+  --accent:#111;--accent-hover:#333;--red:#d32f2f;
+}
+html{scroll-behavior:smooth}
+body{background:var(--bg);color:var(--text);font-family:'DM Sans',sans-serif;min-height:100vh;font-size:14px}
+
+/* Loading / Redirect */
+#loadingOverlay,#redirectOverlay{position:fixed;inset:0;z-index:200;background:var(--bg);display:flex;align-items:center;justify-content:center;flex-direction:column;gap:12px}
+#redirectOverlay{display:none}
+#loadingMsg,#redirectMsg{font-size:.82rem;color:var(--text-dim)}
+.spinner{width:28px;height:28px;border:2px solid var(--border);border-top-color:var(--accent);border-radius:50%;animation:spin .7s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+
+/* Saving bar */
+#savingBar{display:none;position:fixed;bottom:16px;right:16px;z-index:50;background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:8px 14px;font-size:.74rem;color:var(--text-dim)}
+
+/* Auth */
+.auth-overlay{position:fixed;inset:0;z-index:100;background:var(--bg);display:flex;align-items:center;justify-content:center;transition:opacity .4s,visibility .4s}
+.auth-overlay.hidden{opacity:0;visibility:hidden;pointer-events:none}
+.auth-card{width:100%;max-width:380px;padding:24px;text-align:center}
+.auth-card .logo{font-family:'Instrument Serif',serif;font-size:2.4rem;margin-bottom:4px}
+.auth-card .logo-sub{font-size:.7rem;letter-spacing:.2em;text-transform:uppercase;color:var(--text-dim);margin-bottom:40px}
+.auth-card h2{font-family:'Instrument Serif',serif;font-size:1.3rem;font-weight:400;margin-bottom:6px}
+.auth-card .desc{font-size:.82rem;color:var(--text-sec);margin-bottom:24px;line-height:1.5}
+.auth-input{width:100%;padding:14px 16px;border:1px solid var(--border);border-radius:8px;font-family:'DM Sans',sans-serif;font-size:.88rem;outline:none;transition:border .25s;background:var(--surface)}
+.auth-input:focus{border-color:var(--accent)}
+.auth-input::placeholder{color:var(--text-faint)}
+.auth-btn{width:100%;padding:14px;border:none;border-radius:8px;background:var(--accent);color:#fff;font-family:'DM Sans',sans-serif;font-size:.82rem;font-weight:600;letter-spacing:.08em;text-transform:uppercase;cursor:pointer;margin-top:12px;transition:background .25s}
+.auth-btn:hover{background:var(--accent-hover)}
+.auth-btn:disabled{background:var(--text-dim);cursor:not-allowed}
+.auth-step{display:none}.auth-step.active{display:block}
+.auth-error{color:var(--red);font-size:.78rem;margin-top:8px;min-height:20px}
+.resend{font-size:.78rem;color:var(--text-dim);margin-top:16px}
+.resend a{color:var(--accent);text-decoration:underline;cursor:pointer}
+.mail-icon{font-size:2.8rem;margin-bottom:16px}
+.sent-email{font-family:'JetBrains Mono',monospace;font-size:.82rem;color:var(--accent);word-break:break-all}
+.sent-note{font-size:.78rem;color:var(--text-dim);margin-top:16px;line-height:1.6}
+
+/* App */
+.app{display:none}.app.visible{display:block}
+.topbar{display:flex;align-items:center;justify-content:space-between;padding:16px 24px;border-bottom:1px solid var(--border);background:var(--surface);position:sticky;top:0;z-index:10}
+.topbar .brand{font-family:'Instrument Serif',serif;font-size:1.3rem}
+.topbar .user-info{display:flex;align-items:center;gap:10px}
+.topbar .user-email{font-size:.75rem;color:var(--text-dim);font-family:'JetBrains Mono',monospace}
+.topbar .logout{font-size:.7rem;color:var(--text-dim);cursor:pointer;padding:6px 12px;border:1px solid var(--border);border-radius:6px;background:none;font-family:'DM Sans',sans-serif;transition:all .2s}
+.topbar .logout:hover{border-color:var(--red);color:var(--red)}
+.main{max-width:940px;margin:0 auto;padding:32px 24px 80px}
+
+/* Generator */
+.gen-section{margin-bottom:48px}
+.gen-section h2{font-family:'Instrument Serif',serif;font-size:1.4rem;font-weight:400;margin-bottom:20px}
+.gen-grid{display:grid;grid-template-columns:1fr 220px;gap:32px;align-items:start}
+@media(max-width:680px){.gen-grid{grid-template-columns:1fr;justify-items:center}}
+.field{margin-bottom:14px}
+.field label{display:block;font-size:.68rem;letter-spacing:.15em;text-transform:uppercase;color:var(--text-dim);margin-bottom:8px;font-weight:500}
+.field input{width:100%;padding:13px 16px;border:1px solid var(--border);border-radius:8px;font-family:'JetBrains Mono',monospace;font-size:.84rem;outline:none;transition:border .25s;background:var(--surface)}
+.field input:focus{border-color:var(--accent)}
+.field input::placeholder{color:var(--text-faint)}
+.btn-row{display:flex;gap:8px;flex-wrap:wrap}
+.btn{padding:11px 20px;border:1px solid var(--border);border-radius:7px;background:var(--surface);color:var(--text);font-family:'DM Sans',sans-serif;font-size:.74rem;font-weight:500;letter-spacing:.08em;text-transform:uppercase;cursor:pointer;transition:all .2s}
+.btn:hover{background:var(--accent);color:#fff;border-color:var(--accent)}
+.btn-primary{background:var(--accent);color:#fff;border-color:var(--accent)}
+.btn-primary:hover{background:var(--accent-hover)}
+.qr-box{width:220px;height:220px;background:var(--surface);border:1px solid var(--border);border-radius:12px;display:flex;align-items:center;justify-content:center;overflow:hidden}
+.qr-box.empty{border-style:dashed}
+.qr-box.empty::after{content:'QR';font-family:'Instrument Serif',serif;font-size:2.2rem;color:var(--text-faint)}
+.qr-box canvas,.qr-box img{max-width:196px!important;max-height:196px!important}
+
+/* Project list */
+.sec{margin-bottom:48px}
+.sec-head{display:flex;align-items:baseline;justify-content:space-between;margin-bottom:16px}
+.sec-head h2{font-family:'Instrument Serif',serif;font-size:1.4rem;font-weight:400}
+.sec-head .count{font-family:'JetBrains Mono',monospace;font-size:.75rem;color:var(--text-dim)}
+.p-grid{display:grid;gap:8px}
+.p-card{display:grid;grid-template-columns:44px 1fr auto;gap:12px;align-items:center;background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:12px 14px;cursor:pointer;transition:all .2s}
+.p-card:hover{border-color:var(--accent)}
+.p-card.active{border-color:var(--accent);box-shadow:0 0 0 1px var(--accent)}
+.p-card .mqr{width:44px;height:44px;background:var(--surface2);border-radius:6px;display:flex;align-items:center;justify-content:center;overflow:hidden}
+.p-card .mqr img{max-width:40px!important;max-height:40px!important}
+.p-card .info{overflow:hidden}
+.p-card .info .nm{font-weight:500;font-size:.84rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.p-card .info .ur{font-family:'JetBrains Mono',monospace;font-size:.7rem;color:var(--text-dim);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.p-card .rt{display:flex;align-items:center;gap:8px}
+.p-card .rt .meta{text-align:right}
+.p-card .rt .sc{font-family:'JetBrains Mono',monospace;font-size:1rem}
+.p-card .rt .dt{font-size:.62rem;color:var(--text-dim)}
+.del-btn{color:var(--text-faint);cursor:pointer;padding:6px;border-radius:4px;font-size:.72rem;user-select:none;-webkit-user-select:none;transition:all .2s}
+.del-btn:hover{color:var(--red);background:#fef0f0}
+.del-progress{width:100%;height:2px;background:var(--surface2);border-radius:1px;overflow:hidden;margin-top:2px;opacity:0;transition:opacity .15s}
+.del-progress.show{opacity:1}
+.del-progress .bar{height:100%;width:0;background:var(--red);transition:width 2s linear}
+.empty-box{text-align:center;padding:40px 24px;color:var(--text-dim);font-size:.84rem;border:1px dashed var(--border);border-radius:10px;background:var(--surface)}
+
+/* Analytics / Detail */
+#analyticsSection{display:none}
+.detail-top{display:grid;grid-template-columns:auto 1fr;gap:28px;align-items:start;margin-bottom:28px;background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:20px}
+@media(max-width:600px){.detail-top{grid-template-columns:1fr;justify-items:center}}
+.detail-qr-wrap{display:flex;flex-direction:column;align-items:center;gap:10px}
+#detailQr{width:180px;height:180px;display:flex;align-items:center;justify-content:center;background:var(--surface);border:1px solid var(--border);border-radius:8px;overflow:hidden}
+#detailQr img,#detailQr canvas{max-width:180px!important;max-height:180px!important}
+.detail-info{overflow:hidden}
+.detail-info .d-label{font-family:'Instrument Serif',serif;font-size:1.2rem;margin-bottom:4px}
+.detail-info .d-url{font-family:'JetBrains Mono',monospace;font-size:.72rem;color:var(--text-dim);margin-bottom:16px;word-break:break-all}
+.tracking-box{background:var(--surface2);border-radius:7px;padding:10px 12px;margin-bottom:12px}
+.tracking-box .t-label{font-size:.6rem;letter-spacing:.15em;text-transform:uppercase;color:var(--text-dim);margin-bottom:5px;font-weight:500}
+.tracking-box .t-url{font-family:'JetBrains Mono',monospace;font-size:.68rem;color:var(--text-sec);word-break:break-all;line-height:1.5}
+
+.stats-row{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:8px;margin-bottom:20px}
+.stat{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:16px}
+.stat .n{font-family:'JetBrains Mono',monospace;font-size:1.5rem}
+.stat .l{font-size:.62rem;color:var(--text-dim);letter-spacing:.15em;text-transform:uppercase;margin-top:2px}
+.tbl-wrap{background:var(--surface);border:1px solid var(--border);border-radius:8px;overflow-x:auto}
+table{width:100%;border-collapse:collapse;min-width:680px}
+thead th{text-align:left;padding:11px 12px;font-weight:500;font-size:.6rem;letter-spacing:.18em;text-transform:uppercase;color:var(--text-dim);border-bottom:1px solid var(--border);background:var(--surface2)}
+tbody td{padding:9px 12px;border-bottom:1px solid var(--border);font-family:'JetBrains Mono',monospace;font-size:.72rem;color:var(--text-sec)}
+tbody tr:last-child td{border-bottom:none}
+tbody tr:hover td{color:var(--text);background:var(--surface2)}
+.tag{display:inline-block;padding:1px 6px;border-radius:3px;font-size:.66rem;border:1px solid var(--border)}
+.empty-tbl{text-align:center;padding:48px 16px;color:var(--text-faint);font-size:.82rem}
+@keyframes fadeIn{from{opacity:0;transform:translateY(12px)}to{opacity:1;transform:translateY(0)}}
+.fade-in{animation:fadeIn .5s ease both}
+</style>
+</head>
+<body>
+
+<div id="loadingOverlay"><div class="spinner"></div><div id="loadingMsg">Memuat...</div></div>
+<div id="redirectOverlay"><div class="spinner"></div><div id="redirectMsg">Mencatat scan & mengalihkan...</div></div>
+<div id="savingBar"><span id="savingMsg">Menyimpan...</span></div>
+
+<!-- AUTH -->
+<div class="auth-overlay hidden" id="authOverlay">
+  <div class="auth-card">
+    <div class="logo">QR Studio</div>
+    <div class="logo-sub">Generate · Track · Analyze</div>
+    <div class="auth-step active" id="stepEmail">
+      <h2>Masuk ke akun Anda</h2>
+      <p class="desc">Masukkan email — kami kirim magic link untuk login tanpa password.</p>
+      <input class="auth-input" id="emailInput" type="email" placeholder="nama@email.com" autocomplete="email">
+      <div class="auth-error" id="emailError"></div>
+      <button class="auth-btn" id="sendLinkBtn" onclick="sendMagicLink()">Kirim Magic Link</button>
+    </div>
+    <div class="auth-step" id="stepSent">
+      <div class="mail-icon">✉️</div>
+      <h2>Cek email Anda</h2>
+      <p class="desc">Link login telah dikirim ke:</p>
+      <div class="sent-email" id="sentToEmail"></div>
+      <p class="sent-note">Klik link di email — kamu langsung masuk.<br>Link berlaku 1 jam.</p>
+      <p class="resend">Tidak menerima? <a onclick="sendMagicLink()">Kirim ulang</a> · <a onclick="backToEmail()">Ganti email</a></p>
+    </div>
+  </div>
+</div>
+
+<!-- APP -->
+<div class="app" id="app">
+  <div class="topbar">
+    <div class="brand">QR Studio</div>
+    <div class="user-info">
+      <span class="user-email" id="userEmail"></span>
+      <button class="logout" onclick="doLogout()">Logout</button>
+    </div>
+  </div>
+  <div class="main">
+
+    <!-- Generator -->
+    <div class="gen-section fade-in">
+      <h2>Buat QR Code</h2>
+      <div class="gen-grid">
+        <div>
+          <div class="field">
+            <label>URL atau Teks</label>
+            <input type="text" id="urlInput" placeholder="https://example.com">
+          </div>
+          <div class="field">
+            <label>Nama Proyek (opsional)</label>
+            <input type="text" id="labelInput" placeholder="Promo Ramadhan">
+          </div>
+          <div class="btn-row">
+            <button class="btn btn-primary" onclick="generate()">Generate</button>
+            <button class="btn" onclick="downloadQR()">Download PNG</button>
+          </div>
+        </div>
+        <div class="qr-box empty" id="qrBox"></div>
+      </div>
+    </div>
+
+    <!-- Projects -->
+    <div class="sec fade-in" style="animation-delay:.1s">
+      <div class="sec-head">
+        <h2>Projects</h2>
+        <span class="count" id="projCount"></span>
+      </div>
+      <div id="projectsList" class="p-grid">
+        <div class="empty-box">Belum ada project. Generate QR code pertama Anda.</div>
+      </div>
+    </div>
+
+    <!-- Analytics / Detail -->
+    <div class="sec fade-in" id="analyticsSection">
+      <div class="sec-head"><h2>Detail & Analytics</h2></div>
+
+      <!-- QR + Info -->
+      <div class="detail-top">
+        <div class="detail-qr-wrap">
+          <div id="detailQr"></div>
+          <div class="btn-row" style="justify-content:center">
+            <button class="btn" onclick="downloadDetailQR()">Download QR</button>
+          </div>
+        </div>
+        <div class="detail-info">
+          <div class="d-label" id="detailLabel"></div>
+          <div class="d-url" id="detailUrl"></div>
+          <div class="tracking-box">
+            <div class="t-label">Tracking URL (yang ada di dalam QR)</div>
+            <div class="t-url" id="trackingUrlText"></div>
+          </div>
+          <div class="btn-row">
+            <button class="btn" id="copyUrlBtn" onclick="copyTrackingUrl()">Salin URL</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Stats -->
+      <div class="stats-row">
+        <div class="stat"><div class="n" id="totalScans">0</div><div class="l">Total Scans</div></div>
+        <div class="stat"><div class="n" id="uniqueDevices">0</div><div class="l">Unique Devices</div></div>
+        <div class="stat"><div class="n" id="topKec">—</div><div class="l">Top Wilayah</div></div>
+        <div class="stat"><div class="n" id="lastScan">—</div><div class="l">Last Scan</div></div>
+      </div>
+
+      <!-- Scan log -->
+      <div class="tbl-wrap">
+        <table>
+          <thead><tr><th>Waktu</th><th>Device</th><th>Browser</th><th>OS</th><th>Wilayah</th><th>IP</th></tr></thead>
+          <tbody id="logBody">
+            <tr><td colspan="6" class="empty-tbl">Belum ada data scan.</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+  </div>
+</div>
+</body>
+</html>
