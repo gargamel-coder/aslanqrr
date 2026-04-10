@@ -102,16 +102,22 @@ async function handleScanRedirect() {
       scanData
     );
     console.log('[QRS] Scan berhasil dicatat, id:', docRef.id);
-  } catch(e) {
+   } catch(e) {
     // Tampilkan error lengkap agar mudah debug di browser console
     console.error('[QRS] Scan GAGAL dicatat! Code:', e.code, '| Msg:', e.message, '| Detail:', e);
   }
 
-  // Redirect ke URL tujuan
-  const destUrl = decodeURIComponent(dest);
+  // === FIX REDIRECT + FORCE HTTPS (INI YANG BARU) ===
+  let destUrl = decodeURIComponent(dest).trim();
+
+  if (!destUrl.startsWith('http://') && !destUrl.startsWith('https://')) {
+    destUrl = 'https://' + destUrl;
+  }
+
   console.log('[QRS] Redirect ke:', destUrl);
   window.location.replace(destUrl);
   return true;
+}
 }
 
 /* ══════════════════════════════════════
